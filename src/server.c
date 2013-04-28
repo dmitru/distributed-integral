@@ -7,11 +7,24 @@
   Usage:
   server <server port> 
          <broadcast address> <broadcast port> 
+         <start point> <end point> <delta>
+         [<use load balancing>]
          [<maximum number of workers>] [<waiting time in seconds>]
 
   Desription
 
-  TODO
+  When run, a server sends broadcast message on <broadcast port>. 
+  Each worker that receives such a message tries to connect
+  to the server on <server port> (which is given to workers as 
+  a command line argument), and sends a Benchmark structure,
+  which the server then uses to estimate the worker's performance.
+
+  The server divides the work among workers, accordingly
+  to their estimated performance, and sends out the 
+  tasks to them.
+
+  Then it receives the partial results from the workers, 
+  adds them together and prints the overall result of computation.
 */
 
 #include <stdio.h>
@@ -33,7 +46,8 @@ static void printAndDie(const char *msg);
 static void printErrorAndDie(const char *msg);
 static void parseArgumentsOrDie( int argc, char **argv, int *serverPortOut, 
   struct sockaddr_in *broadcastAddressOut, 
-  double *startPointOut, double *endPointOut, double *deltaOut, 
+  double *startPointOut, double *endPointOut, double *deltaOut,
+  int *useLoadBalancingOut, 
   int *maxNumberOfWorkersOut, int *waitingTimeSecondsOut);
 static  int createListeningSocketOrDie( int listenPort, int backlog, int timeoutSeconds);
 static  int sendBroadcast( struct sockaddr_in broadcastAddress, 
@@ -41,21 +55,30 @@ static  int sendBroadcast( struct sockaddr_in broadcastAddress,
 static  int acceptWorker( int serverSocket, int *workerSocketOut, 
   struct sockaddr_in *workerAddressOut);
 static  int recvResponse( int socket, Response *responseOut);
+static  int recvBenchmark( int socket, Benchmark *benchmarkOut);
 static  int sendRequest( int socket, Request request);
+static void computeIntervalsForWorkers( Benchmark *benchmarks, int numberOfWorkers,
+    Interval interval, Interval *workerIntervalsOut);
 
 int main( int argc, char **argv)
 {
   int serverPort;
   int maxNumberOfWorkers;
   int waitingTimeSeconds;
+  int useLoadBalancing;
   struct sockaddr_in broadcastAddress;
   double startPoint, endPoint, delta;
   parseArgumentsOrDie( argc, argv, &serverPort, &broadcastAddress, 
     &startPoint, &endPoint, &delta,
+    &useLoadBalancing,
     &maxNumberOfWorkers, &waitingTimeSeconds);
   int serverSocket = createListeningSocketOrDie( serverPort, 
     maxNumberOfWorkers, waitingTimeSeconds);
   
+  LOG( "Started at port %d with parameters:\n", serverPort);
+  LOG( "    load balancing: %s\n", ( ( useLoadBalancing)? "on" : "off"));
+  LOG( "\n");
+
   LOG( "Sending broadcast message...\n"); 
   if ( sendBroadcast( broadcastAddress, "hello", 6))
     printErrorAndDie( "Error: can't send broadcast message");
@@ -90,12 +113,41 @@ int main( int argc, char **argv)
   if ( numberOfWorkers < 1)
     printAndDie( "No available workers found, exiting...");
 
-  double intervalPerWorker = ( endPoint - startPoint) / numberOfWorkers;
+  Benchmark benchmarks[ maxNumberOfWorkers];
+  for ( int i = 0; i < numberOfWorkers; ++i)
+  {
+    if ( recvBenchmark( workerSockets[ i], &benchmarks[ i]))
+      printErrorAndDie( "Error: can't receive benchmark from a worker");
+    LOG( "Received benchmark from %s:%d:\n    %.12lf ms\n", 
+      inet_ntoa( workerAddresses[ i].sin_addr),
+      ntohs( workerAddresses[ i].sin_port),
+      benchmarks[ i].timeMs);
+  }
+
+  Interval workerIntervals[ maxNumberOfWorkers];
+  if ( useLoadBalancing)
+  {  
+    Interval interval;
+    interval.start = startPoint;
+    interval.end = endPoint;
+    computeIntervalsForWorkers( benchmarks, numberOfWorkers, 
+      interval, workerIntervals);
+  }
+  else
+  {
+    double d = ( endPoint - startPoint) / numberOfWorkers;
+    for ( int i = 0; i < numberOfWorkers; ++i)
+    {
+      workerIntervals[ i].start = startPoint + d * i;
+      workerIntervals[ i].end = startPoint + d * (i + 1);
+    }
+  }
+  
   for ( int i = 0; i < numberOfWorkers; ++i)
   {
     Request request;
-    request.startPoint = startPoint + intervalPerWorker * i;
-    request.endPoint = request.startPoint + intervalPerWorker;
+    request.startPoint = workerIntervals[ i].start;
+    request.endPoint = workerIntervals[ i].end;
     request.delta = delta;
     if ( sendRequest( workerSockets[ i], request))
       printErrorAndDie( "Error: can't send request to a worker");
@@ -112,7 +164,7 @@ int main( int argc, char **argv)
     Response response;
     if ( recvResponse( workerSockets[ i], &response))
       printErrorAndDie( "Error: can't get response from a worker");
-    LOG( "Received response from worker %s:%d.\nResult: %.10lf\nTime:%.3lf ms\n",
+    LOG( "Received response from worker %s:%d\n    Result: %.10lf\n    Time: %.3lf ms\n",
       inet_ntoa( workerAddresses[ i].sin_addr), ntohs( workerAddresses[ i].sin_port), 
       response.result, response.timeElapsed);
     answer += response.result;
@@ -120,8 +172,8 @@ int main( int argc, char **argv)
   }
 
   close( serverSocket);
-  LOG( "Done!\n");
-  printf( "Result: %.10lf\n", answer);
+  LOG( "Done!\n\n");
+  printf( "%.10lf\n", answer);
 }
 
 static int createListeningSocketOrDie( int listeningPort, int backlog, int timeoutSeconds)
@@ -181,6 +233,7 @@ static void printErrorAndDie(const char *msg)
 static void parseArgumentsOrDie( int argc, char **argv, int *serverPortOut, 
   struct sockaddr_in *broadcastAddressOut, 
   double *startPointOut, double *endPointOut, double *deltaOut, 
+  int *useLoadBalancingOut,
   int *maxNumberOfWorkersOut, int *waitingTimeSecondsOut)
 {
   if ( argc < 7)
@@ -204,25 +257,35 @@ static void parseArgumentsOrDie( int argc, char **argv, int *serverPortOut,
   *endPointOut = atof( argv[5]);
   *deltaOut = atof( argv[6]);
 
+  int useLoadBalancing = 1;
+  if ( argc >= 8)
+  {
+    char *endPtr;
+    useLoadBalancing = strtol( argv[ 7], &endPtr, 10);
+    if ( endPtr == argv[ 7])
+      printErrorAndDie( "Error: <use load balancing> must be 1 or 0");
+  }
+  *useLoadBalancingOut = useLoadBalancing;
+
   if ( *deltaOut == 0)
     printErrorAndDie( "Error: <delta> must be a positive real number");
 
   if ( *startPointOut > *endPointOut)
     printErrorAndDie( "Error: <start point> must be lesser than <end point>");    
 
-  int maxNumberOfWorkers = 3;
-  if ( argc >= 8)
+  int maxNumberOfWorkers = 1024;
+  if ( argc >= 9)
   {
-    maxNumberOfWorkers = atoi( argv[7]);
+    maxNumberOfWorkers = atoi( argv[8]);
     if ( maxNumberOfWorkers < 1)
       printErrorAndDie( "Error: <maximum number of workers> must be a positive integer");
   }
   *maxNumberOfWorkersOut = maxNumberOfWorkers;
 
   int waitingTimeSeconds = 3;
-  if ( argc >= 9)
+  if ( argc >= 10)
   {
-    waitingTimeSeconds = atoi( argv[8]);
+    waitingTimeSeconds = atoi( argv[9]);
     if ( waitingTimeSeconds < 1)
       printErrorAndDie( "Error: <waiting time in seconds> must be a positive integer");
   }
@@ -272,20 +335,54 @@ static int acceptWorker( int serverSocket, int *workerSocketOut,
   return 0;
 }
 
+static void computeIntervalsForWorkers( Benchmark *benchmarks, int numberOfWorkers,
+    Interval interval, Interval *workerIntervalsOut)
+{
+  double performanceIndeces[ numberOfWorkers];
+  double sumOfPerformanceIndeces = 0.0l;
+  for ( int i = 0; i < numberOfWorkers; ++i)
+  {
+    double performanceIndecex = 1e-6 / ( benchmarks[ i].timeMs * benchmarks[ i].delta);
+    sumOfPerformanceIndeces += performanceIndecex;
+    performanceIndeces[ i] = performanceIndecex;
+  }
+  
+  double lastEnd = interval.start;
+  double intervalLength = interval.end - interval.start;
+  for ( int i = 0; i < numberOfWorkers; ++i) 
+  {
+    double workerIntervalLength = 
+      intervalLength * ( performanceIndeces[ i] / sumOfPerformanceIndeces);
+    workerIntervalsOut[ i].start = lastEnd;
+    workerIntervalsOut[ i].end = lastEnd + workerIntervalLength;
+    lastEnd += workerIntervalLength;
+  }
+}
+
 static int recvResponse( int socket, Response *responseOut)
 {
   Response response;
   int recvStatus = recv( socket, &response, sizeof( response), 0);
-  if ( recvStatus < 0)
+  if ( recvStatus != sizeof( response))
     return recvStatus;
   *responseOut = response;
+  return 0;
+}
+
+static int recvBenchmark( int socket, Benchmark *benchmarkOut)
+{
+  Benchmark benchmark;
+  int recvStatus = recv( socket, &benchmark, sizeof( benchmark), 0);
+  if ( recvStatus != sizeof( benchmark))
+    return recvStatus;
+  *benchmarkOut = benchmark;
   return 0;
 }
 
 static int sendRequest( int socket, Request request)
 {
   int sendStatus = send( socket, &request, sizeof( request), MSG_NOSIGNAL);
-  if ( sendStatus < 0)
+  if ( sendStatus != sizeof( request))
     return sendStatus;
   return 0;
 }

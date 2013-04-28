@@ -5,21 +5,28 @@
   Author: dmitriy.borodiy@gmail.com
 
   Usage:
-  worker <listening port> <server port> [<number of threads>]
+  worker <listening port> <server port> [<number of threads>] 
+         [<benchmark delta>]
 
   Desription
+
+  When run, the program estimates its performance by measuring
+  how much time it takes to take the integral over [0, 1] with
+  the specified delta <benchmark delta>. 
 
   The program listens to a port <listening port> and waits 
   for any message to come from a server.
 
   On receiving a message, the program connects to the server
-  to port <server port>. After that, it receives 
-  the starting and ending points of integration interval and 
-  the integration step from the server.
+  to port <server port>. Then, it sends the server the 
+  measured time and <benchmark delta> in a Benchmark structure. 
+  After that, it receives the starting and ending points of 
+  integration interval and the integration step from the 
+  server in a Request structure.
 
   Then the program computes the integral (the function
   being hard-coded), possibly with many threads,
-  sends the result back to the server,
+  sends the result back to the server in a Response structure 
   closes the socket to server and waits for another request.
 */
 
@@ -40,12 +47,13 @@
 static void printUsageAndDie();
 static void printErrorAndDie(const char *msg);
 static void parseArgumentsOrDie( int argc, char **argv, int *listenPortOut, 
-  int *serverPortOut, int *numberOfThreadsOut);
+  int *serverPortOut, int *numberOfThreadsOut, double *benchmarkDeltaOut);
 static  int createWorkerSocketOrDie( int listenPort);
 static  int waitForRequest( int workerSocket, struct sockaddr_in *serverAddressOut);
 static  int connectToServer( struct sockaddr_in serverAddress, int *serverSocketOut);
 static  int recvRequest( int serverSocket, Request *requestOut);
 static  int sendResponse( int serverSocket, Response response);
+static  int sendBenchmark( int serverSocket, Benchmark benchmark);
 
 static double functionToIntegrate( double x)
 {
@@ -57,7 +65,25 @@ int main( int argc, char **argv)
   int listeningPort;
   int serverPort;
   int numberOfThreads;
-  parseArgumentsOrDie( argc, argv, &listeningPort, &serverPort, &numberOfThreads);
+  double benchmarkDelta;
+  parseArgumentsOrDie( argc, argv, &listeningPort, &serverPort, &numberOfThreads, &benchmarkDelta);
+
+  LOG( "Running benchmark with delta = %.12lf...\n", benchmarkDelta);
+  double benchmarkTimeMs;
+  double benchmarkResult;
+  MEASURE_TIME_MS( 
+    benchmarkTimeMs, 
+    {
+      integrate( functionToIntegrate, 0.0f, 1.0f,
+        numberOfThreads, benchmarkDelta, &benchmarkResult);
+    }
+  );
+  Benchmark benchmark;
+  benchmark.timeMs = benchmarkTimeMs;
+  benchmark.delta = benchmarkDelta;
+  LOG( "Done! Benchmark time is %.6lf ms\n", benchmarkTimeMs);
+  LOG( "Now waiting for requests...\n");
+
   int workerSocket = createWorkerSocketOrDie( listeningPort);
 
   while ( 1)
@@ -78,15 +104,21 @@ int main( int argc, char **argv)
     LOG( "Connected to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
       ntohs( serverAddress.sin_port));
 
+    LOG( "Sending benchmark to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+      ntohs( serverAddress.sin_port));
+    if ( sendBenchmark( serverSocket, benchmark))
+      LOG( "Error when sending benchmark to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+        ntohs( serverAddress.sin_port));
+
     Request request;
     if ( recvRequest( serverSocket, &request))
     {
-      LOG( "Error when receiving request from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+      LOG( "Error when receiving task from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
         ntohs( serverAddress.sin_port));
     }
     else
     {
-      LOG( "Received request from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+      LOG( "Received task from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
         ntohs( serverAddress.sin_port));
 
       LOG( "Start point: %.8lf\n", request.startPoint); 
@@ -95,34 +127,36 @@ int main( int argc, char **argv)
 
       LOG( "Computing the result using %d thread(s)...\n", numberOfThreads);
 
-      struct timeval start, end;
-      long seconds, useconds;    
-      gettimeofday( &start, NULL);
-
       Response response;
-      integrate( functionToIntegrate, request.startPoint, request.endPoint,
-        numberOfThreads, request.delta, &response.result);
+      double msElapsed;
+      MEASURE_TIME_MS( 
+        msElapsed, 
+        {
+          integrate( functionToIntegrate, request.startPoint, request.endPoint,
+            numberOfThreads, request.delta, &response.result);
+        }
+      );
 
-      gettimeofday( &end, NULL);
-      seconds  = end.tv_sec  - start.tv_sec;
-      useconds = end.tv_usec - start.tv_usec;
-      response.timeElapsed = ( seconds * 1000 + useconds / 1000.0);
+      response.timeElapsed = msElapsed;
 
       LOG( "The result is %.8lf\n", response.result);
       LOG( "It was computed in %.3lf ms\n", response.timeElapsed);
+
 
       if ( sendResponse( serverSocket, response))
         // TODO: The error is not caught
         LOG( "Failed to send the result to %s:%d\n", 
           inet_ntoa( serverAddress.sin_addr),
           ntohs( serverAddress.sin_port));
-      else
+      else {
         LOG( "The result is sent to %s:%d\n", 
           inet_ntoa( serverAddress.sin_addr),
           ntohs( serverAddress.sin_port));
+      }
     }
 
     close( serverSocket);
+    LOG( "\n");
   } 
 
   close( workerSocket);
@@ -187,12 +221,13 @@ static void printErrorAndDie(const char *msg)
 }
 
 static void parseArgumentsOrDie( int argc, char **argv, int *listenPortOut, 
-  int *serverPortOut, int *numberOfThreadsOut)
+  int *serverPortOut, int *numberOfThreadsOut, double *benchmarkDeltaOut)
 {
   if ( argc < 3)
     printUsageAndDie();
   *listenPortOut = atoi( argv[1]);
   *serverPortOut = atoi( argv[2]);
+
   int numberOfThreads = 1;
   if ( argc >= 4)
   {
@@ -201,13 +236,21 @@ static void parseArgumentsOrDie( int argc, char **argv, int *listenPortOut,
       printErrorAndDie( "Error: <number of threads> must be a positive integer");
   }
   *numberOfThreadsOut = numberOfThreads;
+
+  *benchmarkDeltaOut = 10e-9;
+  if ( argc >= 5)
+  {
+    *benchmarkDeltaOut = atof( argv[4]);
+    if ( *benchmarkDeltaOut <= 0)
+      printErrorAndDie( "Error: <benchmark delta> must be a positive real number");
+  }
 }
 
 static int recvRequest( int serverSocket, Request *requestOut)
 {
   Request request;
   int recvStatus = recv( serverSocket, &request, sizeof( request), 0);
-  if ( recvStatus < 0)
+  if ( recvStatus != sizeof( request))
     return recvStatus;
   *requestOut = request;
   return 0;
@@ -216,7 +259,15 @@ static int recvRequest( int serverSocket, Request *requestOut)
 static int sendResponse( int serverSocket, Response response)
 {
   int sendStatus = send( serverSocket, &response, sizeof( response), MSG_NOSIGNAL);
-  if ( sendStatus < 0)
-    return sendStatus;
+  if ( sendStatus != sizeof( response))
+    return -1;
+  return 0;
+}
+
+static int sendBenchmark( int serverSocket, Benchmark benchmark)
+{
+  int sendStatus = send( serverSocket, &benchmark, sizeof( benchmark), MSG_NOSIGNAL);
+  if ( sendStatus != sizeof( benchmark))
+    return -1;
   return 0;
 }
