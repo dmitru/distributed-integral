@@ -11,12 +11,8 @@ CXXFLAGS = -O3 -I$(INCL_DIR) -std=c99 -Wall -pthread -DDEBUG
 
 OBJ_FILES = $(SRC_DIR)/server.o $(SRC_DIR)/worker.o
 
-all: dirs server worker
+all: server worker
 	@echo "Done!"
-
-dirs: 
-	mkdir $(BIN_DIR)
-	mkdir $(OBJ_DIR)
 
 server: $(OBJ_DIR)/server.o
 	$(CXX) $(CXXFLAGS) $^ -o $(BIN_DIR)/$@

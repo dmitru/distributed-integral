@@ -36,142 +36,81 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "integral.h"
 #include "common.h"
 
+#define DEFAULT_NUMBER_OF_WORKERS 16
+#define DEFAULT_SECONDS_TO_WAIT 5
+#define MAX_SECONDS_TO_WAIT 3600
+
+struct Args
+{
+  int serverPort;
+  struct sockaddr_in broadcastAddress;
+  Interval interval;
+  double delta;
+  bool useLoadBalancing; 
+  int maxNumberOfWorkers;
+  int waitingTimeSeconds;
+};
+typedef struct Args Args;
+
 static void printUsageAndDie();
 static void printAndDie(const char *msg);
 static void printErrorAndDie(const char *msg);
-static void parseArgumentsOrDie( int argc, char **argv, int *serverPortOut, 
-  struct sockaddr_in *broadcastAddressOut, 
-  double *startPointOut, double *endPointOut, double *deltaOut,
-  int *useLoadBalancingOut, 
-  int *maxNumberOfWorkersOut, int *waitingTimeSecondsOut);
+static void parseArgumentsOrDie( int argc, char **argv, Args *argsOut);
 static  int createListeningSocketOrDie( int listenPort, int backlog, int timeoutSeconds);
-static  int sendBroadcast( struct sockaddr_in broadcastAddress, 
+static bool sendBroadcast( struct sockaddr_in broadcastAddress, 
   const char *bytes, size_t length);
-static  int acceptWorker( int serverSocket, int *workerSocketOut, 
-  struct sockaddr_in *workerAddressOut);
 static  int recvResponse( int socket, Response *responseOut);
 static  int recvBenchmark( int socket, Benchmark *benchmarkOut);
 static  int sendRequest( int socket, Request request);
-static void computeIntervalsForWorkers( Benchmark *benchmarks, int numberOfWorkers,
-    Interval interval, Interval *workerIntervalsOut);
+static void computeIntervalsForWorkers( bool useLoadBalancing, Benchmark benchmarks[], 
+  int numberOfWorkers, Interval interval, Interval workerIntervalsOut[]);
+static void populateWorkerPool( int serverSocket, int maxNumberOfWorkers, int workerSocketsOut[], 
+  struct sockaddr_in workerAddressesOut[], int *numberOfWorkersOut);
+static void receiveBenchmarksOrDie( int workerSockets[], struct sockaddr_in workerAddresses[], 
+  int numberOfWorkers, Benchmark benchmarksOut[]);
+static void sendRequestsOrDie( int numberOfWorkers, Interval workerIntervals[], 
+  int workerSockets[], struct sockaddr_in workerAddresses[], double delta);
+static void gatherResultsOrDie( int numberOfWorkers, int workerSockets[], 
+  struct sockaddr_in workerAddresses[], double *answerOut);
 
 int main( int argc, char **argv)
 {
-  int serverPort;
-  int maxNumberOfWorkers;
-  int waitingTimeSeconds;
-  int useLoadBalancing;
-  struct sockaddr_in broadcastAddress;
-  double startPoint, endPoint, delta;
-  parseArgumentsOrDie( argc, argv, &serverPort, &broadcastAddress, 
-    &startPoint, &endPoint, &delta,
-    &useLoadBalancing,
-    &maxNumberOfWorkers, &waitingTimeSeconds);
-  int serverSocket = createListeningSocketOrDie( serverPort, 
-    maxNumberOfWorkers, waitingTimeSeconds);
-  
-  LOG( "Started at port %d with parameters:\n", serverPort);
-  LOG( "    load balancing: %s\n", ( ( useLoadBalancing)? "on" : "off"));
-  LOG( "\n");
+  Args args;
+  parseArgumentsOrDie( argc, argv, &args);
 
-  LOG( "Sending broadcast message...\n"); 
-  if ( sendBroadcast( broadcastAddress, "hello", 6))
+  int serverSocket = createListeningSocketOrDie( args.serverPort, 
+    args.maxNumberOfWorkers, args.waitingTimeSeconds);
+
+  if ( !sendBroadcast( args.broadcastAddress, "hello", 6))
     printErrorAndDie( "Error: can't send broadcast message");
-  LOG( "Broadcast message sent. Now waiting for workers...\n");
 
+  int workerSockets[ args.maxNumberOfWorkers];
+  struct sockaddr_in workerAddresses[ args.maxNumberOfWorkers];
   int numberOfWorkers = 0;
-  int workerSockets[ maxNumberOfWorkers];
-  struct sockaddr_in workerAddresses[ maxNumberOfWorkers];
-  while ( numberOfWorkers < maxNumberOfWorkers)
-  {
-    int workerSocket;
-    struct sockaddr_in workerAddress;
-    if ( acceptWorker( serverSocket, &workerSocket, &workerAddress))
-    {
-      if ( errno == EWOULDBLOCK)  // timeout
-        break;
-      LOG( "Error when connecting to worker %s:%d\n", 
-        inet_ntoa( workerAddress.sin_addr),
-        ntohs( workerAddress.sin_port));
-    } 
-    else 
-    {
-      LOG( "Connected to worker %s:%d\n", 
-        inet_ntoa( workerAddress.sin_addr),
-        ntohs( workerAddress.sin_port));
-      workerSockets[ numberOfWorkers] = workerSocket;
-      workerAddresses[ numberOfWorkers] = workerAddress;
-      numberOfWorkers ++;
-    }
-  }
-
+  populateWorkerPool( serverSocket, args.maxNumberOfWorkers, workerSockets, workerAddresses, &numberOfWorkers);
   if ( numberOfWorkers < 1)
-    printAndDie( "No available workers found, exiting...");
+    printAndDie( "Sorry, no workers found. Exiting...");
 
-  Benchmark benchmarks[ maxNumberOfWorkers];
-  for ( int i = 0; i < numberOfWorkers; ++i)
-  {
-    if ( recvBenchmark( workerSockets[ i], &benchmarks[ i]))
-      printErrorAndDie( "Error: can't receive benchmark from a worker");
-    LOG( "Received benchmark from %s:%d:\n    %.12lf ms\n", 
-      inet_ntoa( workerAddresses[ i].sin_addr),
-      ntohs( workerAddresses[ i].sin_port),
-      benchmarks[ i].timeMs);
-  }
+  Benchmark benchmarks[ args.maxNumberOfWorkers];
+  receiveBenchmarksOrDie( workerSockets, workerAddresses, numberOfWorkers, benchmarks);
 
-  Interval workerIntervals[ maxNumberOfWorkers];
-  if ( useLoadBalancing)
-  {  
-    Interval interval;
-    interval.start = startPoint;
-    interval.end = endPoint;
-    computeIntervalsForWorkers( benchmarks, numberOfWorkers, 
-      interval, workerIntervals);
-  }
-  else
-  {
-    double d = ( endPoint - startPoint) / numberOfWorkers;
-    for ( int i = 0; i < numberOfWorkers; ++i)
-    {
-      workerIntervals[ i].start = startPoint + d * i;
-      workerIntervals[ i].end = startPoint + d * (i + 1);
-    }
-  }
-  
-  for ( int i = 0; i < numberOfWorkers; ++i)
-  {
-    Request request;
-    request.startPoint = workerIntervals[ i].start;
-    request.endPoint = workerIntervals[ i].end;
-    request.delta = delta;
-    if ( sendRequest( workerSockets[ i], request))
-      printErrorAndDie( "Error: can't send request to a worker");
-    LOG( "Sent request to worker %s:%d\n", 
-      inet_ntoa( workerAddresses[ i].sin_addr),
-      ntohs( workerAddresses[ i].sin_port));
-  }
+  Interval workerIntervals[ args.maxNumberOfWorkers];
+  computeIntervalsForWorkers( args.useLoadBalancing, benchmarks, numberOfWorkers, 
+    args.interval, workerIntervals);
 
-  LOG( "All requests are sent; now waiting for responses...\n");
+  sendRequestsOrDie( numberOfWorkers, workerIntervals, workerSockets, workerAddresses, args.delta);
 
-  double answer = 0.0f;
-  for ( int i = 0; i < numberOfWorkers; ++i)
-  {
-    Response response;
-    if ( recvResponse( workerSockets[ i], &response))
-      printErrorAndDie( "Error: can't get response from a worker");
-    LOG( "Received response from worker %s:%d\n    Result: %.10lf\n    Time: %.3lf ms\n",
-      inet_ntoa( workerAddresses[ i].sin_addr), ntohs( workerAddresses[ i].sin_port), 
-      response.result, response.timeElapsed);
-    answer += response.result;
-    close( workerSockets[ i]);
-  }
+  double answer;
+  gatherResultsOrDie( numberOfWorkers, workerSockets, workerAddresses, &answer);
 
   close( serverSocket);
+
   LOG( "Done!\n\n");
   printf( "%.10lf\n", answer);
 }
@@ -213,7 +152,7 @@ static int createListeningSocketOrDie( int listeningPort, int backlog, int timeo
 static void printUsageAndDie()
 {
   fprintf( stderr, "Usage: server <server port> <broadcast address> <broadcast port>\n"
-    "       <start point> <end point> <delta>\n"
+    "       <start point> <end point> <delta> [<use load balancing?>]\n"
     "      [<maximum number of workers>] [<waiting time in seconds>]\n");
   exit( EXIT_FAILURE);
 }
@@ -230,16 +169,12 @@ static void printErrorAndDie(const char *msg)
   exit( EXIT_FAILURE);
 }
 
-static void parseArgumentsOrDie( int argc, char **argv, int *serverPortOut, 
-  struct sockaddr_in *broadcastAddressOut, 
-  double *startPointOut, double *endPointOut, double *deltaOut, 
-  int *useLoadBalancingOut,
-  int *maxNumberOfWorkersOut, int *waitingTimeSecondsOut)
+static void parseArgumentsOrDie( int argc, char **argv, Args *argsOut)
 {
   if ( argc < 7)
     printUsageAndDie();
 
-  *serverPortOut = atoi( argv[1]);
+  int serverPort = atoi( argv[1]);
   int broadcastPort = atoi( argv[3]);
 
   char *broadcastAddr = argv[2];
@@ -251,11 +186,10 @@ static void parseArgumentsOrDie( int argc, char **argv, int *serverPortOut,
   broadcastAddress.sin_family = AF_INET;
   broadcastAddress.sin_addr.s_addr = inAddr.s_addr;
   broadcastAddress.sin_port = htons(broadcastPort);
-  *broadcastAddressOut = broadcastAddress;
 
-  *startPointOut = atof( argv[4]);
-  *endPointOut = atof( argv[5]);
-  *deltaOut = atof( argv[6]);
+  double startPoint = atof( argv[4]);
+  double endPoint = atof( argv[5]);
+  double delta = atof( argv[6]);
 
   int useLoadBalancing = 1;
   if ( argc >= 8)
@@ -263,53 +197,65 @@ static void parseArgumentsOrDie( int argc, char **argv, int *serverPortOut,
     char *endPtr;
     useLoadBalancing = strtol( argv[ 7], &endPtr, 10);
     if ( endPtr == argv[ 7])
-      printErrorAndDie( "Error: <use load balancing> must be 1 or 0");
+      printAndDie( "Error: <use load balancing> must be 1 or 0");
   }
-  *useLoadBalancingOut = useLoadBalancing;
 
-  if ( *deltaOut == 0)
-    printErrorAndDie( "Error: <delta> must be a positive real number");
+  if ( delta == 0)
+    printAndDie( "Error: <delta> must be a positive real number");
 
-  if ( *startPointOut > *endPointOut)
-    printErrorAndDie( "Error: <start point> must be lesser than <end point>");    
+  if ( startPoint > endPoint)
+    printAndDie( "Error: <start point> must be lesser than <end point>");    
 
-  int maxNumberOfWorkers = 1024;
+  int maxNumberOfWorkers = DEFAULT_NUMBER_OF_WORKERS;
   if ( argc >= 9)
   {
     maxNumberOfWorkers = atoi( argv[8]);
     if ( maxNumberOfWorkers < 1)
-      printErrorAndDie( "Error: <maximum number of workers> must be a positive integer");
+      printAndDie( "Error: <maximum number of workers> must be a positive integer");
   }
-  *maxNumberOfWorkersOut = maxNumberOfWorkers;
 
-  int waitingTimeSeconds = 3;
+  int waitingTimeSeconds = DEFAULT_SECONDS_TO_WAIT;
   if ( argc >= 10)
   {
     waitingTimeSeconds = atoi( argv[9]);
-    if ( waitingTimeSeconds < 1)
-      printErrorAndDie( "Error: <waiting time in seconds> must be a positive integer");
+    if ( waitingTimeSeconds < 1 || waitingTimeSeconds > MAX_SECONDS_TO_WAIT)
+      printAndDie( "Error: <waiting time in seconds> must be a positive integer lesser than 3600");
   }
-  *waitingTimeSecondsOut = waitingTimeSeconds;
+
+  LOG( "Started at port %d with parameters:\n", serverPort);
+  LOG( "    load balancing: %s\n", ( ( useLoadBalancing)? "on" : "off"));
+  LOG( "\n");
+
+  argsOut->interval.start = startPoint;
+  argsOut->interval.end = endPoint;
+  argsOut->delta = delta;
+  argsOut->broadcastAddress = broadcastAddress;
+  argsOut->serverPort = serverPort;
+  argsOut->useLoadBalancing = useLoadBalancing;
+  argsOut->maxNumberOfWorkers = maxNumberOfWorkers;
+  argsOut->waitingTimeSeconds = waitingTimeSeconds;
 }
 
-static int sendBroadcast( struct sockaddr_in broadcastAddress, const char *bytes, size_t length)
+static bool sendBroadcast( struct sockaddr_in broadcastAddress, const char *bytes, size_t length)
 {
+  LOG( "Sending broadcast message...\n"); 
   int broadcastSocket = socket( AF_INET, SOCK_DGRAM, 0);
   int optValue = 1;
   socklen_t optLength = sizeof( optValue);
   if ( setsockopt( broadcastSocket, SOL_SOCKET, SO_BROADCAST, &optValue, optLength) < 0)
   {
     close( broadcastSocket);
-    return -1;
+    return false;
   }
   if ( sendto( broadcastSocket, bytes, length, 0, (struct sockaddr *) &broadcastAddress, 
     sizeof( broadcastAddress)) < 0)
   {
     close( broadcastSocket);
-    return -1; 
+    return false; 
   }
   close( broadcastSocket);
-  return 0;
+  LOG( "Broadcast message sent. Now waiting for workers...\n");
+  return true;
 }
 
 static int acceptWorker( int serverSocket, int *workerSocketOut, 
@@ -335,7 +281,7 @@ static int acceptWorker( int serverSocket, int *workerSocketOut,
   return 0;
 }
 
-static void computeIntervalsForWorkers( Benchmark *benchmarks, int numberOfWorkers,
+static void computeIntervalsForWorkersWithLoadBalancing( Benchmark *benchmarks, int numberOfWorkers,
     Interval interval, Interval *workerIntervalsOut)
 {
   double performanceIndeces[ numberOfWorkers];
@@ -359,12 +305,31 @@ static void computeIntervalsForWorkers( Benchmark *benchmarks, int numberOfWorke
   }
 }
 
+static void computeIntervalsForWorkers( bool useLoadBalancing, Benchmark benchmarks[], 
+  int numberOfWorkers, Interval interval, Interval workerIntervalsOut[])
+{
+  if ( useLoadBalancing)
+  {  
+    computeIntervalsForWorkersWithLoadBalancing( benchmarks, numberOfWorkers, 
+      interval, workerIntervalsOut);
+  }
+  else
+  {
+    double d = ( interval.end - interval.start) / numberOfWorkers;
+    for ( int i = 0; i < numberOfWorkers; ++i)
+    {
+      workerIntervalsOut[ i].start = interval.start + d * i;
+      workerIntervalsOut[ i].end = interval.start + d * (i + 1);
+    }
+  }
+}
+
 static int recvResponse( int socket, Response *responseOut)
 {
   Response response;
   int recvStatus = recv( socket, &response, sizeof( response), 0);
   if ( recvStatus != sizeof( response))
-    return recvStatus;
+    return -1;
   *responseOut = response;
   return 0;
 }
@@ -385,4 +350,84 @@ static int sendRequest( int socket, Request request)
   if ( sendStatus != sizeof( request))
     return sendStatus;
   return 0;
+}
+
+static void populateWorkerPool( int serverSocket, int maxNumberOfWorkers, int workerSocketsOut[], 
+  struct sockaddr_in workerAddressesOut[], int *numberOfWorkersOut)
+{
+  int numberOfWorkers = 0;
+  while ( numberOfWorkers < maxNumberOfWorkers)
+  {
+    int workerSocket;
+    struct sockaddr_in workerAddress;
+    if ( acceptWorker( serverSocket, &workerSocket, &workerAddress))
+    {
+      if ( errno == EWOULDBLOCK)  // timeout
+        break;
+      LOG( "Error when connecting to worker %s:%d\n", 
+        inet_ntoa( workerAddress.sin_addr),
+        ntohs( workerAddress.sin_port));
+    } 
+    LOG( "Connected to worker %s:%d\n", 
+      inet_ntoa( workerAddress.sin_addr),
+      ntohs( workerAddress.sin_port));
+    workerSocketsOut[ numberOfWorkers] = workerSocket;
+    workerAddressesOut[ numberOfWorkers] = workerAddress;
+    numberOfWorkers ++;
+  }
+
+  *numberOfWorkersOut = numberOfWorkers;
+}
+
+static void receiveBenchmarksOrDie( int workerSockets[], struct sockaddr_in workerAddresses[], 
+  int numberOfWorkers, Benchmark benchmarksOut[])
+{
+  for ( int i = 0; i < numberOfWorkers; ++i)
+  {
+    Benchmark benchmark;
+    if ( recvBenchmark( workerSockets[ i], &benchmark))
+      printErrorAndDie( "Error: can't receive benchmark from a worker");
+    LOG( "Received benchmark from %s:%d:\n    %.12lf ms\n", 
+      inet_ntoa( workerAddresses[ i].sin_addr),
+      ntohs( workerAddresses[ i].sin_port),
+      benchmark.timeMs);
+    benchmarksOut[ i] = benchmark;
+  }
+}
+
+static void sendRequestsOrDie( int numberOfWorkers, Interval workerIntervals[], 
+  int workerSockets[], struct sockaddr_in workerAddresses[], double delta)
+{
+  for ( int i = 0; i < numberOfWorkers; ++i)
+  {
+    Request request;
+    request.startPoint = workerIntervals[ i].start;
+    request.endPoint = workerIntervals[ i].end;
+    request.delta = delta;
+    if ( sendRequest( workerSockets[ i], request))
+      printErrorAndDie( "Error: can't send request to a worker");
+    LOG( "Sent request to worker %s:%d\n", 
+      inet_ntoa( workerAddresses[ i].sin_addr),
+      ntohs( workerAddresses[ i].sin_port));
+  }
+
+  LOG( "All requests are sent; now waiting for responses...\n");
+}
+
+static void gatherResultsOrDie( int numberOfWorkers, int workerSockets[], 
+  struct sockaddr_in workerAddresses[], double *answerOut)
+{
+  double answer = 0.0f;
+  for ( int i = 0; i < numberOfWorkers; ++i)
+  {
+    Response response;
+    if ( recvResponse( workerSockets[ i], &response))
+      printErrorAndDie( "Error: can't get response from a worker");
+    LOG( "Received response from worker %s:%d\n    Result: %.10lf\n    Time: %.3lf ms\n",
+      inet_ntoa( workerAddresses[ i].sin_addr), ntohs( workerAddresses[ i].sin_port), 
+      response.result, response.timeElapsed);
+    answer += response.result;
+    close( workerSockets[ i]);
+  }
+  *answerOut = answer;
 }

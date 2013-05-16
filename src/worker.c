@@ -40,126 +40,98 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "integral.h"
 #include "common.h"
 
-static void printUsageAndDie();
-static void printErrorAndDie(const char *msg);
-static void parseArgumentsOrDie( int argc, char **argv, int *listenPortOut, 
-  int *serverPortOut, int *numberOfThreadsOut, double *benchmarkDeltaOut);
+struct Args
+{
+  int listeningPort; 
+  int serverPort; 
+  int numberOfThreads;
+  double benchmarkDelta;
+};
+typedef struct Args Args;
+
+static void parseArgumentsOrDie( int argc, char **argv, Args *argsOut);
 static  int createWorkerSocketOrDie( int listenPort);
-static  int waitForRequest( int workerSocket, struct sockaddr_in *serverAddressOut);
-static  int connectToServer( struct sockaddr_in serverAddress, int *serverSocketOut);
-static  int recvRequest( int serverSocket, Request *requestOut);
-static  int sendResponse( int serverSocket, Response response);
-static  int sendBenchmark( int serverSocket, Benchmark benchmark);
+static bool waitForServerAddress( int workerSocket, int serverPort, struct sockaddr_in *serverAddressOut);
+static bool createServerSocket( struct sockaddr_in serverAddress, int *serverSocketOut);
+static bool receiveRequest( int serverSocket, struct sockaddr_in serverAddress, Request *requestOut);
+static bool computeIntegral( Request request, int numberOfThreads, Response *responseOut);
+static bool sendResponse( int serverSocket, struct sockaddr_in serverAddress, Response response);
+static void doBenchmark( int numberOfThreads, double benchmarkDelta, Benchmark *benchmarkOut);
+static bool sendBenchmark( int serverSocket, struct sockaddr_in serverAddress, Benchmark benchmark);
 
 static double functionToIntegrate( double x)
 {
-  return x;
+  return x * x;
 }
 
 int main( int argc, char **argv)
 {
-  int listeningPort;
-  int serverPort;
-  int numberOfThreads;
-  double benchmarkDelta;
-  parseArgumentsOrDie( argc, argv, &listeningPort, &serverPort, &numberOfThreads, &benchmarkDelta);
+  Args args;
+  parseArgumentsOrDie( argc, argv, &args);
 
-  LOG( "Running benchmark with delta = %.12lf...\n", benchmarkDelta);
-  double benchmarkTimeMs;
-  double benchmarkResult;
-  MEASURE_TIME_MS( 
-    benchmarkTimeMs, 
-    {
-      integrate( functionToIntegrate, 0.0f, 1.0f,
-        numberOfThreads, benchmarkDelta, &benchmarkResult);
-    }
-  );
   Benchmark benchmark;
-  benchmark.timeMs = benchmarkTimeMs;
-  benchmark.delta = benchmarkDelta;
-  LOG( "Done! Benchmark time is %.6lf ms\n", benchmarkTimeMs);
-  LOG( "Now waiting for requests...\n");
+  doBenchmark( args.numberOfThreads, args.benchmarkDelta, &benchmark);
 
-  int workerSocket = createWorkerSocketOrDie( listeningPort);
+  int workerSocket = createWorkerSocketOrDie( args.listeningPort);
 
-  while ( 1)
+  for( ;;) 
   {
     struct sockaddr_in serverAddress;
-    if ( waitForRequest( workerSocket, &serverAddress) < 0)
-      printErrorAndDie( "Error when processing a request");
-    
-    LOG( "Request received from %s\n", inet_ntoa( serverAddress.sin_addr));
-    serverAddress.sin_port = htons( serverPort);
-    int serverSocket;
-    if ( connectToServer( serverAddress, &serverSocket)) 
-    {
-      LOG( "Failed to connect to server at %s:%d\n", inet_ntoa( serverAddress.sin_addr),
-        ntohs( serverAddress.sin_port));
+    if ( !waitForServerAddress( workerSocket, args.serverPort, &serverAddress))
       continue;
-    }
-    LOG( "Connected to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
-      ntohs( serverAddress.sin_port));
+    
+    int serverSocket;
+    if ( !createServerSocket( serverAddress, &serverSocket))
+      continue;
 
-    LOG( "Sending benchmark to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
-      ntohs( serverAddress.sin_port));
-    if ( sendBenchmark( serverSocket, benchmark))
-      LOG( "Error when sending benchmark to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
-        ntohs( serverAddress.sin_port));
+    if ( !sendBenchmark( serverSocket, serverAddress, benchmark)) 
+    {
+      close( serverSocket);
+      continue;    
+    }
 
     Request request;
-    if ( recvRequest( serverSocket, &request))
+    if ( !receiveRequest( serverSocket, serverAddress, &request)) 
     {
-      LOG( "Error when receiving task from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
-        ntohs( serverAddress.sin_port));
+      close( serverSocket);
+      continue;
     }
-    else
+
+    Response response;
+    if ( !computeIntegral( request, args.numberOfThreads, &response)) 
     {
-      LOG( "Received task from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
-        ntohs( serverAddress.sin_port));
+      close( serverSocket);
+      continue;
+    }
 
-      LOG( "Start point: %.8lf\n", request.startPoint); 
-      LOG( "End point: %.8lf\n", request.endPoint);
-      LOG( "Delta: %.16lf\n", request.delta);
-
-      LOG( "Computing the result using %d thread(s)...\n", numberOfThreads);
-
-      Response response;
-      double msElapsed;
-      MEASURE_TIME_MS( 
-        msElapsed, 
-        {
-          integrate( functionToIntegrate, request.startPoint, request.endPoint,
-            numberOfThreads, request.delta, &response.result);
-        }
-      );
-
-      response.timeElapsed = msElapsed;
-
-      LOG( "The result is %.8lf\n", response.result);
-      LOG( "It was computed in %.3lf ms\n", response.timeElapsed);
-
-
-      if ( sendResponse( serverSocket, response))
-        // TODO: The error is not caught
-        LOG( "Failed to send the result to %s:%d\n", 
-          inet_ntoa( serverAddress.sin_addr),
-          ntohs( serverAddress.sin_port));
-      else {
-        LOG( "The result is sent to %s:%d\n", 
-          inet_ntoa( serverAddress.sin_addr),
-          ntohs( serverAddress.sin_port));
-      }
+    if ( !sendResponse( serverSocket, serverAddress, response)) 
+    {
+      close( serverSocket);
+      continue;
     }
 
     close( serverSocket);
-    LOG( "\n");
   } 
 
   close( workerSocket);
+}
+
+static void printUsageAndDie()
+{
+  fprintf( stderr, "Usage: worker <listening port> <server port> "
+    "[<number of threads>]\n");
+  exit( EXIT_FAILURE);
+}
+
+static void printErrorAndDie(const char *msg)
+{
+  fprintf( stderr, "%s: %s\n", msg, strerror( errno));
+  exit( EXIT_FAILURE);
 }
 
 static int createWorkerSocketOrDie( int listeningPort)
@@ -180,7 +152,8 @@ static int createWorkerSocketOrDie( int listeningPort)
   return workerSocket;
 }
 
-static int waitForRequest( int workerSocket, struct sockaddr_in *serverAddressOut)
+static int waitForServerAddressHelper( int workerSocket, 
+  struct sockaddr_in *serverAddressOut)
 {
   struct sockaddr_in serverAddress;
   socklen_t addressLength = sizeof( serverAddress);
@@ -195,7 +168,22 @@ static int waitForRequest( int workerSocket, struct sockaddr_in *serverAddressOu
   return recvStatus;
 }
 
-static int connectToServer( struct sockaddr_in serverAddress, 
+static bool waitForServerAddress( int workerSocket, int serverPort, 
+  struct sockaddr_in *serverAddressOut)
+{
+  int error;
+  error = waitForServerAddressHelper( workerSocket, serverAddressOut);
+  if ( !error) 
+  {
+    LOG( "Error when processing a request");
+    return false;
+  }
+  serverAddressOut->sin_port = htons( serverPort);
+  LOG( "Request received from %s\n", inet_ntoa( serverAddressOut->sin_addr));
+  return true;
+}
+
+static int createServerSocketHelper( struct sockaddr_in serverAddress, 
   int *serverSocketOut)
 {
   int serverSocket = socket( AF_INET, SOCK_STREAM, 0);
@@ -207,26 +195,27 @@ static int connectToServer( struct sockaddr_in serverAddress,
   return 0;
 }
 
-static void printUsageAndDie()
+static bool createServerSocket( struct sockaddr_in serverAddress, 
+  int *serverSocketOut)
 {
-  fprintf( stderr, "Usage: worker <listening port> <server port> "
-    "[<number of threads>]\n");
-  exit( EXIT_FAILURE);
+  int error = createServerSocketHelper( serverAddress, serverSocketOut);
+  if ( error) 
+  {
+    LOG( "Failed to connect to server at %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+      ntohs( serverAddress.sin_port));
+    return false;
+  }
+  LOG( "Connected to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+    ntohs( serverAddress.sin_port));
+  return true;
 }
 
-static void printErrorAndDie(const char *msg)
-{
-  fprintf( stderr, "%s: %s\n", msg, strerror( errno));
-  exit( EXIT_FAILURE);
-}
-
-static void parseArgumentsOrDie( int argc, char **argv, int *listenPortOut, 
-  int *serverPortOut, int *numberOfThreadsOut, double *benchmarkDeltaOut)
+static void parseArgumentsOrDie( int argc, char **argv, Args *argsOut)
 {
   if ( argc < 3)
     printUsageAndDie();
-  *listenPortOut = atoi( argv[1]);
-  *serverPortOut = atoi( argv[2]);
+  argsOut->listeningPort = atoi( argv[1]);
+  argsOut->serverPort = atoi( argv[2]);
 
   int numberOfThreads = 1;
   if ( argc >= 4)
@@ -235,39 +224,128 @@ static void parseArgumentsOrDie( int argc, char **argv, int *listenPortOut,
     if ( numberOfThreads < 1)
       printErrorAndDie( "Error: <number of threads> must be a positive integer");
   }
-  *numberOfThreadsOut = numberOfThreads;
+  argsOut->numberOfThreads = numberOfThreads;
 
-  *benchmarkDeltaOut = 10e-9;
+  argsOut->benchmarkDelta = 10e-9;
   if ( argc >= 5)
   {
-    *benchmarkDeltaOut = atof( argv[4]);
-    if ( *benchmarkDeltaOut <= 0)
+    argsOut->benchmarkDelta = atof( argv[4]);
+    if ( argsOut->benchmarkDelta <= 0)
       printErrorAndDie( "Error: <benchmark delta> must be a positive real number");
   }
 }
 
-static int recvRequest( int serverSocket, Request *requestOut)
+static bool receiveRequestHelper( int serverSocket, Request *requestOut)
 {
   Request request;
   int recvStatus = recv( serverSocket, &request, sizeof( request), 0);
   if ( recvStatus != sizeof( request))
-    return recvStatus;
+    return false;
   *requestOut = request;
-  return 0;
+  return true;
 }
 
-static int sendResponse( int serverSocket, Response response)
+static bool receiveRequest( int serverSocket, struct sockaddr_in serverAddress, Request *requestOut)
 {
-  int sendStatus = send( serverSocket, &response, sizeof( response), MSG_NOSIGNAL);
-  if ( sendStatus != sizeof( response))
+  int is_ok = receiveRequestHelper( serverSocket, requestOut);
+  if ( !is_ok)
+  {
+    LOG( "Error when receiving task from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+      ntohs( serverAddress.sin_port));
+    return false;
+  }
+  LOG( "Received task from %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+    ntohs( serverAddress.sin_port));
+  LOG( "Start point: %.8lf\n", requestOut->startPoint); 
+  LOG( "End point: %.8lf\n", requestOut->endPoint);
+  LOG( "Delta: %.16lf\n", requestOut->delta);
+  return true;
+}
+
+static bool sendResponseHelper( int serverSocket, Response response)
+{
+  int bytesCount = sizeof( response);
+  int sentBytesCount = send( serverSocket, &response, bytesCount, MSG_NOSIGNAL);
+  if ( sentBytesCount != bytesCount)
     return -1;
   return 0;
 }
 
-static int sendBenchmark( int serverSocket, Benchmark benchmark)
+static bool sendResponse( int serverSocket, struct sockaddr_in serverAddress, Response response)
+{
+  bool is_ok = sendResponseHelper( serverSocket, response);
+  if ( is_ok)
+  {
+    LOG( "Failed to send the result to %s:%d\n", 
+      inet_ntoa( serverAddress.sin_addr),
+      ntohs( serverAddress.sin_port));
+    return false;
+  }
+
+  LOG( "The result is sent to %s:%d\n", 
+    inet_ntoa( serverAddress.sin_addr),
+    ntohs( serverAddress.sin_port));
+  return true;
+}
+
+static void doBenchmark( int numberOfThreads, double benchmarkDelta, Benchmark *benchmarkOut)
+{
+  LOG( "Running benchmark with delta = %.12lf...\n", benchmarkDelta);
+  double benchmarkTimeMs;
+  MEASURE_TIME_MS( 
+    benchmarkTimeMs, 
+    {
+      integrate( functionToIntegrate, 0.0f, 1.0f,
+        numberOfThreads, benchmarkDelta, benchmarkOut);
+    }
+  );
+  benchmarkOut->timeMs = benchmarkTimeMs;
+  benchmarkOut->delta = benchmarkDelta;
+  LOG( "Done! Benchmark time is %.6lf ms\n", benchmarkTimeMs);
+  LOG( "Now waiting for requests...\n");
+}
+
+static bool sendBenchmarkHelper( int serverSocket, Benchmark benchmark)
 {
   int sendStatus = send( serverSocket, &benchmark, sizeof( benchmark), MSG_NOSIGNAL);
   if ( sendStatus != sizeof( benchmark))
-    return -1;
-  return 0;
+    return false;
+  return true;
+}
+
+static bool sendBenchmark( int serverSocket, struct sockaddr_in serverAddress, Benchmark benchmark)
+{
+  LOG( "Sending benchmark to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+    ntohs( serverAddress.sin_port));
+  bool is_ok = sendBenchmarkHelper( serverSocket, benchmark);
+  if ( !is_ok)
+  {
+    LOG( "Error when sending benchmark to %s:%d\n", inet_ntoa( serverAddress.sin_addr),
+      ntohs( serverAddress.sin_port));
+  }
+  return is_ok;
+}
+
+static bool computeIntegral( Request request, int numberOfThreads, Response *responseOut)
+{
+  LOG( "Computing the result using %d thread(s)...\n", numberOfThreads);
+  Response response;
+  double msElapsed;
+  MEASURE_TIME_MS( 
+    msElapsed, 
+    {
+      if ( integrate( functionToIntegrate, request.startPoint, request.endPoint,
+              numberOfThreads, request.delta, &response.result)) 
+      {
+        LOG( "Error when computing integral\n");
+        return false;
+      }
+    }
+  );
+  response.timeElapsed = msElapsed;
+  LOG( "The result is %.8lf\n", response.result);
+  LOG( "It was computed in %.3lf ms\n", response.timeElapsed);
+
+  *responseOut = response;
+  return true;
 }
